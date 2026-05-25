@@ -1,0 +1,49 @@
+
+default:
+#  http_timeout: 10s
+#  ignore_tls_errors: true
+
+  dry_run: true
+
+permanent:
+  ignore:
+    - "*.example.com"
+
+  192.168.1.1:  # router
+    - adguardhome.example.com
+
+  192.168.1.10: # container host
+    - traefik.example.com
+
+  192.168.1.20: # backup node
+    - traefik.backup.hubmann.casa
+
+source:
+
+  traefik_container_host:
+    type: traefik_api
+    api_url: https://traefik.example.com/
+    api_user: traefik_api_user
+    api_password: some_secret
+    default_target: 192.168.1.10
+    http_timeout: 10s
+    ignore_tls_errors: false
+
+  traefik_backup:
+    type: traefik_api
+    api_url: https://traefik.backup.example.com/
+    api_user: traefik_api_user
+    api_password: some_secret
+    default_target: 192.168.1.20
+    http_timeout: 10s
+    ignore_tls_errors: false
+
+target:
+  adguardhome:
+    type: adguardhome
+    url: https://192.168.1.1:9443
+    api_user: agh_admin
+    api_password: some_secret
+    http_timeout: 10s
+    ignore_tls_errors: true
+
