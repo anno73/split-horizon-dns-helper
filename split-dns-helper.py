@@ -478,167 +478,152 @@ def merge_traefik_data(config):
     return all_hostnames
 
 
-def main():
-    args = parse_args()
-    config = load_config(args.config)
-    dry_run_suffix = ' (dry run)' if args.dry_run else ''
+def fail(message, code=1):
+    print(message, file=sys.stderr)
+    sys.exit(code)
 
-    if args.command == 'daemon':
-        print(f'Not implemented: Command: daemon{dry_run_suffix}')
-    elif args.command == 'sync':
-        print(f'Command: sync{dry_run_suffix}')
-        agh_config = find_agh_config(config)
-        if agh_config is None:
-            print('No AdGuard Home configuration found in config', file=sys.stderr)
-            sys.exit(1)
 
-        # Build desired records from sources and permanent config
-        desired = {}
-        permanent_map = {}
-        ignore_list = set()
-        seen = {}
-        duplicate_records = []
-        perm_section = config.get('permanent', {}) or {}
+def extract_ignore_list(perm_section):
+    ignore_list = set()
+    if not isinstance(perm_section, dict):
+        return ignore_list
+    ignore_val = perm_section.get('ignore')
+    if isinstance(ignore_val, list):
+        for item in ignore_val:
+            if isinstance(item, str):
+                ignore_list.add(item.strip())
+    elif isinstance(ignore_val, str):
+        ignore_list.add(ignore_val.strip())
+    return ignore_list
 
-        if not isinstance(perm_section, dict):
-            print('Error: permanent section must be a mapping of answer -> [hosts]', file=sys.stderr)
-            sys.exit(1)
 
-        # Extract ignore list first
-        if 'ignore' in perm_section:
-            ignore_val = perm_section.get('ignore')
-            if isinstance(ignore_val, list):
-                for item in ignore_val:
-                    if isinstance(item, str):
-                        ignore_list.add(item.strip())
-            elif isinstance(ignore_val, str):
-                ignore_list.add(ignore_val.strip())
-            for domain in ignore_list:
-                print(f'Ignore: {domain}')
+def build_permanent_map(perm_section):
+    if not isinstance(perm_section, dict):
+        raise ValueError('permanent section must be a mapping of answer -> [hosts]')
 
-        for answer, hosts in perm_section.items():
-            if answer == 'ignore':
+    ignore_list = extract_ignore_list(perm_section)
+    permanent_map = {}
+    seen = {}
+    duplicates = []
+
+    for answer, hosts in perm_section.items():
+        if answer == 'ignore':
+            continue
+
+        if isinstance(hosts, list):
+            entries = hosts
+        elif isinstance(hosts, str):
+            entries = [hosts]
+        else:
+            raise ValueError(f'Invalid hosts list for answer {answer} in permanent config')
+
+        for host in entries:
+            if not isinstance(host, str):
                 continue
-            if isinstance(hosts, list):
-                for host in hosts:
-                    if not isinstance(host, str):
-                        continue
-                    host = host.strip()
-                    record = f'{host}:{answer}'
-                    if host in seen:
-                        if seen[host] is not None:
-                            duplicate_records.append(f'{host}:{seen[host]}')
-                            seen[host] = None
-                        duplicate_records.append(record)
-                    else:
-                        seen[host] = answer
-                    permanent_map[host] = answer
-            elif isinstance(hosts, str):
-                host = hosts.strip()
-                record = f'{host}:{answer}'
-                if host in seen:
-                    if seen[host] is not None:
-                        duplicate_records.append(f'{host}:{seen[host]}')
-                        seen[host] = None
-                    duplicate_records.append(record)
-                else:
-                    seen[host] = answer
-                permanent_map[host] = answer
+            host = host.strip()
+            if host in seen:
+                if seen[host] is not None:
+                    duplicates.append(f'{host}:{seen[host]}')
+                    seen[host] = None
+                duplicates.append(f'{host}:{answer}')
             else:
-                print(f'Warning: invalid hosts list for answer {answer} in permanent config', file=sys.stderr)
-                sys.exit(1)
+                seen[host] = answer
+            permanent_map[host] = answer
 
-        if duplicate_records:
-            dup_list = ', '.join(duplicate_records)
-            print(f'Error: duplicate permanent domain records in config: {dup_list}', file=sys.stderr)
-            sys.exit(1)
+    return permanent_map, ignore_list, duplicates
 
-        try:
-            traefik_data = merge_traefik_data(config)
-            traefik_configs = find_traefik_configs(config)
-            for data in traefik_data:
-                source = data.get('source')
-                hostnames = data.get('hostnames', []) or []
-                source_cfg = traefik_configs.get(source, {}) if isinstance(traefik_configs, dict) else {}
-                default_target = source_cfg.get('default_target')
-                if not default_target:
-                    for h in hostnames:
-                        if h in permanent_map:
-                            continue
-                        if h in ignore_list:
-                            continue
-                        print(f'Warning: no default_target for source {source}, skipping hostname {h}', file=sys.stderr)
+
+def build_desired_from_sources(config, permanent_map, ignore_list, warn_missing_default_target=False):
+    desired = {}
+    traefik_sources = {}
+
+    traefik_data = merge_traefik_data(config)
+    traefik_configs = find_traefik_configs(config)
+
+    for data in traefik_data:
+        source = data.get('source')
+        hostnames = data.get('hostnames', []) or []
+        source_cfg = traefik_configs.get(source, {}) if isinstance(traefik_configs, dict) else {}
+        default_target = source_cfg.get('default_target')
+
+        if default_target is None and warn_missing_default_target:
+            for h in hostnames:
+                if h in permanent_map or h in ignore_list:
                     continue
-                for h in hostnames:
-                    if h in ignore_list:
-                        print(f'Warning: hostname {h} from source {source} is in ignore list, skipping', file=sys.stderr)
-                        continue
-                    if h in permanent_map:
-                        continue
-                    desired[h] = default_target
-        except Exception as exc:
-            print(f'Failed to read sources: {exc}', file=sys.stderr)
-            sys.exit(1)
+                print(f'Warning: no default_target for source {source}, skipping hostname {h}', file=sys.stderr)
+            continue
 
-        # Permanent entries override source-derived records
-        for h, a in permanent_map.items():
-            desired[h] = a
-
-        # Fetch current target rewrites
-        try:
-            rewrites = fetch_agh_dns_rewrites(agh_config)
-        except Exception as exc:
-            print(f'Failed to read AdGuard Home rewrites: {exc}', file=sys.stderr)
-            sys.exit(1)
-
-        # Build current mapping: domain -> list of answers
-        current = {}
-        for r in rewrites:
-            d = r.get('domain')
-            a = r.get('answer')
-            if d is None or a is None:
+        for h in hostnames:
+            traefik_sources.setdefault(h, []).append(source)
+            if h in ignore_list:
+                if warn_missing_default_target:
+                    print(f'Warning: hostname {h} from source {source} is in ignore list, skipping', file=sys.stderr)
                 continue
-            current.setdefault(d, []).append(a)
-
-        # Ensure desired records exist (add or replace differing answers)
-        for d, a in desired.items():
-            existing_answers = current.get(d, [])
-            # Report unchanged records (exact match)
-            if existing_answers and set(existing_answers) == {a}:
-                if args.dry_run:
-                    print(f'[DRY RUN] Unchanged rewrite: {d} -> {a}')
-                else:
-                    print(f'Unchanged rewrite: {d} -> {a}')
+            if h in permanent_map:
                 continue
+            if default_target is not None:
+                desired[h] = default_target
 
-            # delete differing answers
-            for old in list(existing_answers):
-                if old != a:
-                    if args.dry_run:
-                        print(f'[DRY RUN] Would delete rewrite: {d} -> {old}')
-                    else:
-                        try:
-                            delete_agh_rewrite(agh_config, d, old, dry_run=False)
-                            print(f'Deleted rewrite: {d} -> {old}')
-                        except Exception as exc:
-                            print(f'Failed to delete rewrite {d} -> {old}: {exc}', file=sys.stderr)
-            # add desired if not present
-            if a not in current.get(d, []):
-                if args.dry_run:
-                    print(f'[DRY RUN] Would add rewrite: {d} -> {a}')
-                else:
-                    try:
-                        add_agh_rewrite(agh_config, d, a, dry_run=False)
-                        print(f'Added rewrite: {d} -> {a}')
-                    except Exception as exc:
-                        print(f'Failed to add rewrite {d} -> {a}: {exc}', file=sys.stderr)
+    return desired, traefik_sources
 
-        # Remove records present in target but not desired (unless permanent)
-        for d, answers in current.items():
-            if d in desired or d in permanent_map:
-                continue
-            for old in answers:
-                if args.dry_run:
+
+def build_current_mapping(rewrites):
+    current = {}
+    for r in rewrites:
+        d = r.get('domain')
+        a = r.get('answer')
+        if d is None or a is None:
+            continue
+        current.setdefault(d, []).append(a)
+    return current
+
+
+def build_current_answer_sets(rewrites):
+    current = {}
+    for r in rewrites:
+        domain = r.get('domain')
+        answer = r.get('answer')
+        if domain is None or answer is None:
+            continue
+        current.setdefault(domain, set()).add(answer)
+    return current
+
+
+def command_daemon(dry_run):
+    suffix = ' (dry run)' if dry_run else ''
+    print(f'Not implemented: Command: daemon{suffix}')
+
+
+def command_sync(config, dry_run):
+    print(f'Command: sync{" (dry run)" if dry_run else ""}')
+    agh_config = find_agh_config(config)
+    if agh_config is None:
+        fail('No AdGuard Home configuration found in config')
+
+    perm_section = config.get('permanent', {}) or {}
+    permanent_map, ignore_list, duplicates = build_permanent_map(perm_section)
+    if duplicates:
+        raise ValueError(f'Error: duplicate permanent domain records in config: {", ".join(duplicates)}')
+
+    desired, _ = build_desired_from_sources(config, permanent_map, ignore_list, warn_missing_default_target=True)
+    desired.update(permanent_map)
+
+    try:
+        rewrites = fetch_agh_dns_rewrites(agh_config)
+    except Exception as exc:
+        fail(f'Failed to read AdGuard Home rewrites: {exc}')
+
+    current = build_current_mapping(rewrites)
+
+    for d, a in desired.items():
+        existing_answers = current.get(d, [])
+        if existing_answers and set(existing_answers) == {a}:
+            print(f'[DRY RUN] Unchanged rewrite: {d} -> {a}' if dry_run else f'Unchanged rewrite: {d} -> {a}')
+            continue
+
+        for old in list(existing_answers):
+            if old != a:
+                if dry_run:
                     print(f'[DRY RUN] Would delete rewrite: {d} -> {old}')
                 else:
                     try:
@@ -646,180 +631,155 @@ def main():
                         print(f'Deleted rewrite: {d} -> {old}')
                     except Exception as exc:
                         print(f'Failed to delete rewrite {d} -> {old}: {exc}', file=sys.stderr)
-    elif args.command == 'report':
-        print(f'Command: report{dry_run_suffix}')
-        agh_config = find_agh_config(config)
+
+        if a not in current.get(d, []):
+            if dry_run:
+                print(f'[DRY RUN] Would add rewrite: {d} -> {a}')
+            else:
+                try:
+                    add_agh_rewrite(agh_config, d, a, dry_run=False)
+                    print(f'Added rewrite: {d} -> {a}')
+                except Exception as exc:
+                    print(f'Failed to add rewrite {d} -> {a}: {exc}', file=sys.stderr)
+
+    for d, answers in current.items():
+        if d in desired or d in permanent_map:
+            continue
+        for old in answers:
+            if dry_run:
+                print(f'[DRY RUN] Would delete rewrite: {d} -> {old}')
+            else:
+                try:
+                    delete_agh_rewrite(agh_config, d, old, dry_run=False)
+                    print(f'Deleted rewrite: {d} -> {old}')
+                except Exception as exc:
+                    print(f'Failed to delete rewrite {d} -> {old}: {exc}', file=sys.stderr)
+
+
+def command_report(config, dry_run):
+    print(f'Command: report{" (dry run)" if dry_run else ""}')
+    agh_config = find_agh_config(config)
+    rewrites = []
+    if agh_config is not None:
         try:
-            rewrites = []
-            if agh_config is not None:
-                rewrites = fetch_agh_dns_rewrites(agh_config)
+            rewrites = fetch_agh_dns_rewrites(agh_config)
         except Exception as exc:
             print(f'Failed to read AdGuard Home rewrites: {exc}', file=sys.stderr)
 
-        # current answers in target
-        current = {}
-        for r in (rewrites or []):
-            domain = r.get('domain')
-            answer = r.get('answer')
-            if domain is None or answer is None:
-                continue
-            current.setdefault(domain, set()).add(answer)
+    current = build_current_answer_sets(rewrites)
+    perm_section = config.get('permanent', {}) or {}
+    permanent_map, ignore_list, duplicates = build_permanent_map(perm_section)
+    if duplicates:
+        fail(f'Error: duplicate permanent domain records in config: {", ".join(duplicates)}')
 
-        # build desired mapping from sources and permanent
-        desired = {}
-        permanent_map = {}
-        ignore_list = set()
-        perm_section = config.get('permanent', {}) or {}
-        if isinstance(perm_section, dict):
-            # Extract ignore list first
-            if 'ignore' in perm_section:
-                ignore_val = perm_section.get('ignore')
-                if isinstance(ignore_val, list):
-                    for item in ignore_val:
-                        if isinstance(item, str):
-                            ignore_list.add(item.strip())
-                elif isinstance(ignore_val, str):
-                    ignore_list.add(ignore_val.strip())
-            
-            for answer, hosts in perm_section.items():
-                if answer == 'ignore':
-                    continue
-                if isinstance(hosts, list):
-                    for host in hosts:
-                        if not isinstance(host, str):
-                            continue
-                        permanent_map[host.strip()] = answer
-                elif isinstance(hosts, str):
-                    permanent_map[hosts.strip()] = answer
+    desired, traefik_sources = {}, {}
+    try:
+        desired, traefik_sources = build_desired_from_sources(config, permanent_map, ignore_list)
+    except Exception:
+        desired, traefik_sources = {}, {}
 
-        traefik_sources = {}
-        try:
-            traefik_data = merge_traefik_data(config)
-            traefik_configs = find_traefik_configs(config)
-            for data in traefik_data:
-                source = data.get('source')
-                hostnames = data.get('hostnames', []) or []
-                source_cfg = traefik_configs.get(source, {}) if isinstance(traefik_configs, dict) else {}
-                default_target = source_cfg.get('default_target')
-                for h in hostnames:
-                    traefik_sources.setdefault(h, []).append(source)
-                    if h not in permanent_map and h not in desired:
-                        desired[h] = default_target
-        except Exception:
-            traefik_data = []
+    desired.update(permanent_map)
+    all_domains = set(desired.keys()) | set(current.keys()) | set(traefik_sources.keys())
 
-        # permanent overrides desired
-        for h, a in permanent_map.items():
-            desired[h] = a
-
-        # collect union of domains
-        all_domains = set(desired.keys()) | set(current.keys()) | set(traefik_sources.keys())
-
-        # Output CSV lines: domain,target,source,exists|missing,is_permanent
-        for d in sorted(all_domains):
-            if d in ignore_list:
-                continue
-            is_permanent = 'permanent' if d in permanent_map else 'derived'
+    for d in sorted(all_domains):
+        if d in ignore_list:
+            continue
+        is_permanent = 'permanent' if d in permanent_map else 'derived'
+        if d in permanent_map:
+            source = 'permanent'
+        elif d in traefik_sources:
+            source = ';'.join(sorted(set(traefik_sources.get(d, []))))
+        elif d in current:
+            source = 'target-only'
+        else:
             source = ''
-            if d in permanent_map:
-                source = 'permanent'
-            elif d in traefik_sources:
-                source = ';'.join(sorted(set(traefik_sources.get(d, []))))
-            elif d in current:
-                source = 'target-only'
 
-            target = desired.get(d)
-            if target is None:
-                # domain exists only in target; choose first existing answer
-                answers = sorted(current.get(d, []))
-                target = answers[0] if answers else ''
+        target = desired.get(d)
+        if target is None:
+            answers = sorted(current.get(d, []))
+            target = answers[0] if answers else ''
 
-            exists = 'missing'
-            if d in current and target in current.get(d, set()):
-                exists = 'exists'
+        exists = 'exists' if d in current and target in current.get(d, set()) else 'missing'
+        print(f'{d},{target},{source},{exists},{is_permanent}')
 
-            print(f'{d},{target},{source},{exists},{is_permanent}')
-    elif args.command == 'add':
-        # Check if domain is in ignore list
-        ignore_list = set()
-        perm_section = config.get('permanent', {}) or {}
-        if isinstance(perm_section, dict) and 'ignore' in perm_section:
-            ignore_val = perm_section.get('ignore')
-            if isinstance(ignore_val, list):
-                for item in ignore_val:
-                    if isinstance(item, str):
-                        ignore_list.add(item.strip())
-            elif isinstance(ignore_val, str):
-                ignore_list.add(ignore_val.strip())
-        
-        if args.hostname in ignore_list:
-            print(f'Error: hostname {args.hostname} is in ignore list and cannot be added', file=sys.stderr)
+
+def command_add(config, args):
+    perm_section = config.get('permanent', {}) or {}
+    permanent_map, ignore_list, duplicates = build_permanent_map(perm_section)
+    if duplicates:
+        fail(f'Error: duplicate permanent domain records in config: {", ".join(duplicates)}')
+
+    if args.hostname in ignore_list:
+        fail(f'Error: hostname {args.hostname} is in ignore list and cannot be added')
+
+    agh_config = find_agh_config(config)
+    if agh_config is None:
+        fail('No AdGuard Home configuration found in config')
+
+    try:
+        rewrites = fetch_agh_dns_rewrites(agh_config)
+        existing = find_agh_rewrite(rewrites, args.hostname)
+        if existing:
+            print(f'Warning: hostname {args.hostname} already exists', file=sys.stderr)
+            print(f'Existing record: {json.dumps(existing)}', file=sys.stderr)
             sys.exit(1)
-        
-        agh_config = find_agh_config(config)
-        if agh_config is None:
-            print('No AdGuard Home configuration found in config', file=sys.stderr)
-            sys.exit(1)
-        
-        try:
-            rewrites = fetch_agh_dns_rewrites(agh_config)
-            existing = find_agh_rewrite(rewrites, args.hostname)
-            if existing:
-                print(f'Warning: hostname {args.hostname} already exists', file=sys.stderr)
-                print(f'Existing record: {json.dumps(existing)}', file=sys.stderr)
+
+        result = add_agh_rewrite(agh_config, args.hostname, args.target, dry_run=args.dry_run)
+        print(f'[DRY RUN] Would add rewrite: {json.dumps(result)}' if args.dry_run else f'Added rewrite: {json.dumps(result)}')
+    except Exception as exc:
+        fail(f'Failed to add rewrite: {exc}')
+
+
+def command_delete(config, args):
+    agh_config = find_agh_config(config)
+    if agh_config is None:
+        fail('No AdGuard Home configuration found in config')
+
+    try:
+        rewrites = fetch_agh_dns_rewrites(agh_config)
+
+        if args.target is None:
+            matching = find_agh_rewrites_by_domain(rewrites, args.hostname)
+            if not matching:
+                fail(f'Warning: hostname {args.hostname} not found')
+            if len(matching) > 1:
+                print(f'Warning: hostname {args.hostname} has multiple records', file=sys.stderr)
+                for record in matching:
+                    print(f'  {json.dumps(record)}', file=sys.stderr)
                 sys.exit(1)
-            
-            result = add_agh_rewrite(agh_config, args.hostname, args.target, dry_run=args.dry_run)
-            if args.dry_run:
-                print(f'[DRY RUN] Would add rewrite: {json.dumps(result)}')
-            else:
-                print(f'Added rewrite: {json.dumps(result)}')
-        except Exception as exc:
-            print(f'Failed to add rewrite: {exc}', file=sys.stderr)
-            sys.exit(1)
-    elif args.command == 'delete':
-        agh_config = find_agh_config(config)
-        if agh_config is None:
-            print('No AdGuard Home configuration found in config', file=sys.stderr)
-            sys.exit(1)
-        
+
+            record = matching[0]
+            result = delete_agh_rewrite(agh_config, args.hostname, record.get('answer'), dry_run=args.dry_run)
+        else:
+            record = find_agh_rewrite_by_pair(rewrites, args.hostname, args.target)
+            if not record:
+                fail(f'Warning: record {args.hostname} -> {args.target} not found')
+            result = delete_agh_rewrite(agh_config, args.hostname, args.target, dry_run=args.dry_run)
+
+        print(f'[DRY RUN] Would delete rewrite: {json.dumps(result)}' if args.dry_run else f'Deleted rewrite: {json.dumps(result)}')
+    except Exception as exc:
+        fail(f'Failed to delete rewrite: {exc}')
+
+
+def main():
+    args = parse_args()
+    config = load_config(args.config)
+
+    if args.command == 'daemon':
+        command_daemon(args.dry_run)
+    elif args.command == 'sync':
         try:
-            rewrites = fetch_agh_dns_rewrites(agh_config)
-            
-            if args.target is None:
-                matching = find_agh_rewrites_by_domain(rewrites, args.hostname)
-                if not matching:
-                    print(f'Warning: hostname {args.hostname} not found', file=sys.stderr)
-                    sys.exit(1)
-                if len(matching) > 1:
-                    print(f'Warning: hostname {args.hostname} has multiple records', file=sys.stderr)
-                    for record in matching:
-                        print(f'  {json.dumps(record)}', file=sys.stderr)
-                    sys.exit(1)
-                
-                record = matching[0]
-                result = delete_agh_rewrite(agh_config, args.hostname, record.get('answer'), dry_run=args.dry_run)
-                if args.dry_run:
-                    print(f'[DRY RUN] Would delete rewrite: {json.dumps(result)}')
-                else:
-                    print(f'Deleted rewrite: {json.dumps(result)}')
-            else:
-                record = find_agh_rewrite_by_pair(rewrites, args.hostname, args.target)
-                if not record:
-                    print(f'Warning: record {args.hostname} -> {args.target} not found', file=sys.stderr)
-                    sys.exit(1)
-                
-                result = delete_agh_rewrite(agh_config, args.hostname, args.target, dry_run=args.dry_run)
-                if args.dry_run:
-                    print(f'[DRY RUN] Would delete rewrite: {json.dumps(result)}')
-                else:
-                    print(f'Deleted rewrite: {json.dumps(result)}')
-        except Exception as exc:
-            print(f'Failed to delete rewrite: {exc}', file=sys.stderr)
-            sys.exit(1)
+            command_sync(config, args.dry_run)
+        except ValueError as exc:
+            fail(str(exc))
+    elif args.command == 'report':
+        command_report(config, args.dry_run)
+    elif args.command == 'add':
+        command_add(config, args)
+    elif args.command == 'delete':
+        command_delete(config, args)
     else:
-        print('Unknown command', file=sys.stderr)
-        sys.exit(2)
+        fail('Unknown command', 2)
 
 
 if __name__ == "__main__":
