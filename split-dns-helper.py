@@ -120,6 +120,23 @@ def merge_default_values(config):
     return merged
 
 
+def build_basic_auth_header(api_user, api_password):
+    if not api_user or not api_password:
+        return None
+    credentials = f'{api_user}:{api_password}'
+    encoded = base64.b64encode(credentials.encode('utf-8')).decode('ascii')
+    return f'Basic {encoded}'
+
+
+def build_ssl_context(ignore_tls, endpoint):
+    if not ignore_tls or not isinstance(endpoint, str) or not endpoint.lower().startswith('https://'):
+        return None
+    context = ssl.create_default_context()
+    context.check_hostname = False
+    context.verify_mode = ssl.CERT_NONE
+    return context
+
+
 def parse_args():
     parser = argparse.ArgumentParser(prog="dsh", description="DNS split-horizon helper")
     parser.add_argument('-c', '--config', default=DEFAULT_CONFIG_FILE, help=f'Configuration file path (default: {DEFAULT_CONFIG_FILE})')
@@ -180,23 +197,16 @@ def fetch_agh_dns_rewrites(agh_config):
 
     api_user = agh_config.get('api_user') or agh_config.get('user')
     api_password = agh_config.get('api_password') or agh_config.get('password')
+    auth_header = build_basic_auth_header(api_user, api_password)
 
     endpoint = url.rstrip('/') + '/control/rewrite/list'
     request = Request(endpoint, method='GET')
     request.add_header('Accept', 'application/json')
-
-    if api_user and api_password:
-        credentials = f'{api_user}:{api_password}'
-        encoded = base64.b64encode(credentials.encode('utf-8')).decode('ascii')
-        request.add_header('Authorization', f'Basic {encoded}')
+    if auth_header:
+        request.add_header('Authorization', auth_header)
 
     timeout = agh_config.get('http_timeout', 30)
-    ignore_tls = bool(agh_config.get('ignore_tls_errors', False))
-    context = None
-    if ignore_tls and endpoint.lower().startswith('https://'):
-        context = ssl.create_default_context()
-        context.check_hostname = False
-        context.verify_mode = ssl.CERT_NONE
+    context = build_ssl_context(bool(agh_config.get('ignore_tls_errors', False)), endpoint)
 
     try:
         with urlopen(request, timeout=timeout, context=context) as response:
@@ -231,6 +241,7 @@ def add_agh_rewrite(agh_config, domain, answer, dry_run=False):
 
     api_user = agh_config.get('api_user') or agh_config.get('user')
     api_password = agh_config.get('api_password') or agh_config.get('password')
+    auth_header = build_basic_auth_header(api_user, api_password)
 
     if dry_run:
         return {'domain': domain, 'answer': answer, 'dry_run': True}
@@ -242,19 +253,11 @@ def add_agh_rewrite(agh_config, domain, answer, dry_run=False):
     request = Request(endpoint, method='POST', data=data)
     request.add_header('Content-Type', 'application/json')
     request.add_header('Accept', 'application/json')
-
-    if api_user and api_password:
-        credentials = f'{api_user}:{api_password}'
-        encoded = base64.b64encode(credentials.encode('utf-8')).decode('ascii')
-        request.add_header('Authorization', f'Basic {encoded}')
+    if auth_header:
+        request.add_header('Authorization', auth_header)
 
     timeout = agh_config.get('http_timeout', 30)
-    ignore_tls = bool(agh_config.get('ignore_tls_errors', False))
-    context = None
-    if ignore_tls and endpoint.lower().startswith('https://'):
-        context = ssl.create_default_context()
-        context.check_hostname = False
-        context.verify_mode = ssl.CERT_NONE
+    context = build_ssl_context(bool(agh_config.get('ignore_tls_errors', False)), endpoint)
 
     try:
         with urlopen(request, timeout=timeout, context=context) as response:
@@ -302,6 +305,7 @@ def delete_agh_rewrite(agh_config, domain, answer, dry_run=False):
 
     api_user = agh_config.get('api_user') or agh_config.get('user')
     api_password = agh_config.get('api_password') or agh_config.get('password')
+    auth_header = build_basic_auth_header(api_user, api_password)
 
     if dry_run:
         return {'domain': domain, 'answer': answer, 'dry_run': True}
@@ -313,19 +317,11 @@ def delete_agh_rewrite(agh_config, domain, answer, dry_run=False):
     request = Request(endpoint, method='POST', data=data)
     request.add_header('Content-Type', 'application/json')
     request.add_header('Accept', 'application/json')
-
-    if api_user and api_password:
-        credentials = f'{api_user}:{api_password}'
-        encoded = base64.b64encode(credentials.encode('utf-8')).decode('ascii')
-        request.add_header('Authorization', f'Basic {encoded}')
+    if auth_header:
+        request.add_header('Authorization', auth_header)
 
     timeout = agh_config.get('http_timeout', 30)
-    ignore_tls = bool(agh_config.get('ignore_tls_errors', False))
-    context = None
-    if ignore_tls and endpoint.lower().startswith('https://'):
-        context = ssl.create_default_context()
-        context.check_hostname = False
-        context.verify_mode = ssl.CERT_NONE
+    context = build_ssl_context(bool(agh_config.get('ignore_tls_errors', False)), endpoint)
 
     try:
         with urlopen(request, timeout=timeout, context=context) as response:
@@ -391,15 +387,11 @@ def fetch_traefik_routers(traefik_config, instance_name):
         request.add_header('Accept', 'application/json')
 
         if api_user and api_password:
-            credentials = f'{api_user}:{api_password}'
-            encoded = base64.b64encode(credentials.encode('utf-8')).decode('ascii')
-            request.add_header('Authorization', f'Basic {encoded}')
+            auth_header = build_basic_auth_header(api_user, api_password)
+            if auth_header:
+                request.add_header('Authorization', auth_header)
 
-        context = None
-        if ignore_tls and endpoint.lower().startswith('https://'):
-            context = ssl.create_default_context()
-            context.check_hostname = False
-            context.verify_mode = ssl.CERT_NONE
+        context = build_ssl_context(ignore_tls, endpoint)
 
         try:
             with urlopen(request, timeout=timeout, context=context) as response:
@@ -426,7 +418,7 @@ def fetch_traefik_routers(traefik_config, instance_name):
                 else:
                     page = next_page
         except HTTPError as exc:
-            if exc.code == 400 and style is not None:
+            if exc.code == 400:
                 # Fall back to alternate pagination style or no pagination.
                 break
             raise RuntimeError(f'Traefik API error {exc.code}: {exc.reason}') from exc
@@ -435,9 +427,8 @@ def fetch_traefik_routers(traefik_config, instance_name):
         except json.JSONDecodeError as exc:
             raise RuntimeError('Failed to decode Traefik API response as JSON') from exc
 
-    if all_routers:
-#        print(f'Total routers collected from {instance_name}: {len(all_routers)}')
-        return all_routers, instance_name
+    # Return an empty list when no routers were found, so callers can handle it uniformly.
+    return all_routers, instance_name
 
 
 def merge_traefik_data(config):
