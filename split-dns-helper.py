@@ -148,12 +148,12 @@ def parse_args():
     subparsers.add_parser('sync', help='Sync changes')
     subparsers.add_parser('report', help='Generate report')
 
-    p_add = subparsers.add_parser('add', help='Add hostname [hostname|ip]')
-    p_add.add_argument('hostname', help='Hostname to add')
+    p_add = subparsers.add_parser('add', help='Add domain [domain|ip]')
+    p_add.add_argument('domain', help='Domain to add')
     p_add.add_argument('target', nargs='?', help='Optional target hostname or IP')
 
     p_del = subparsers.add_parser('delete', help='Delete hostname [hostname|ip]')
-    p_del.add_argument('hostname', help='Hostname to delete')
+    p_del.add_argument('domain', help='Domain to delete')
     p_del.add_argument('target', nargs='?', help='Optional target hostname or IP')
 
     return parser.parse_args()
@@ -517,18 +517,18 @@ def build_permanent_map(perm_section):
         else:
             raise ValueError(f'Invalid hosts list for answer {answer} in permanent config')
 
-        for host in entries:
-            if not isinstance(host, str):
-                continue
-            host = host.strip()
-            if host in seen:
-                if seen[host] is not None:
-                    duplicates.append(f'{host}:{seen[host]}')
-                    seen[host] = None
-                duplicates.append(f'{host}:{answer}')
-            else:
-                seen[host] = answer
-            permanent_map[host] = answer
+        for domain in entries:
+                if not isinstance(domain, str):
+                    continue
+                domain = domain.strip()
+                if domain in seen:
+                    if seen[domain] is not None:
+                        duplicates.append(f'{domain}:{seen[domain]}')
+                        seen[domain] = None
+                    duplicates.append(f'{domain}:{answer}')
+                else:
+                    seen[domain] = answer
+                permanent_map[domain] = answer
 
     return permanent_map, ignore_list, duplicates
 
@@ -547,22 +547,22 @@ def build_desired_from_sources(config, permanent_map, ignore_list, warn_missing_
         default_target = source_cfg.get('default_target')
 
         if default_target is None and warn_missing_default_target:
-            for h in hostnames:
-                if h in permanent_map or h in ignore_list:
+            for domain in hostnames:
+                if domain in permanent_map or domain in ignore_list:
                     continue
-                print(f'Warning: no default_target for source {source}, skipping hostname {h}', file=sys.stderr)
+                print(f'Warning: no default_target for source {source}, skipping hostname {domain}', file=sys.stderr)
             continue
 
-        for h in hostnames:
-            traefik_sources.setdefault(h, []).append(source)
-            if h in ignore_list:
+        for domain in hostnames:
+            traefik_sources.setdefault(domain, []).append(source)
+            if domain in ignore_list:
                 if warn_missing_default_target:
-                    print(f'Warning: hostname {h} from source {source} is in ignore list, skipping', file=sys.stderr)
+                    print(f'Warning: hostname {domain} from source {source} is in ignore list, skipping', file=sys.stderr)
                 continue
-            if h in permanent_map:
+            if domain in permanent_map:
                 continue
             if default_target is not None:
-                desired[h] = default_target
+                desired[domain] = default_target
 
     return desired, traefik_sources
 
@@ -570,11 +570,11 @@ def build_desired_from_sources(config, permanent_map, ignore_list, warn_missing_
 def build_current_mapping(rewrites):
     current = {}
     for r in rewrites:
-        d = r.get('domain')
-        a = r.get('answer')
-        if d is None or a is None:
+        domain = r.get('domain')
+        answer = r.get('answer')
+        if domain is None or answer is None:
             continue
-        current.setdefault(d, []).append(a)
+        current.setdefault(domain, []).append(answer)
     return current
 
 
@@ -615,45 +615,45 @@ def command_sync(config, dry_run):
 
     current = build_current_mapping(rewrites)
 
-    for d, a in desired.items():
-        existing_answers = current.get(d, [])
-        if existing_answers and set(existing_answers) == {a}:
-            print(f'[DRY RUN] Unchanged rewrite: {d} -> {a}' if dry_run else f'Unchanged rewrite: {d} -> {a}')
+    for domain, answer in desired.items():
+        existing_answers = current.get(domain, [])
+        if existing_answers and set(existing_answers) == {answer}:
+            print(f'[DRY RUN] Unchanged rewrite: {domain} -> {answer}' if dry_run else f'Unchanged rewrite: {domain} -> {answer}')
             continue
 
         for old in list(existing_answers):
-            if old != a:
+            if old != answer:
                 if dry_run:
-                    print(f'[DRY RUN] Would delete rewrite: {d} -> {old}')
+                    print(f'[DRY RUN] Would delete rewrite: {domain} -> {old}')
                 else:
                     try:
-                        delete_agh_rewrite(agh_config, d, old, dry_run=False)
-                        print(f'Deleted rewrite: {d} -> {old}')
+                        delete_agh_rewrite(agh_config, domain, old, dry_run=False)
+                        print(f'Deleted rewrite: {domain} -> {old}')
                     except Exception as exc:
-                        print(f'Failed to delete rewrite {d} -> {old}: {exc}', file=sys.stderr)
+                        print(f'Failed to delete rewrite {domain} -> {old}: {exc}', file=sys.stderr)
 
-        if a not in current.get(d, []):
+        if answer not in current.get(domain, []):
             if dry_run:
-                print(f'[DRY RUN] Would add rewrite: {d} -> {a}')
+                print(f'[DRY RUN] Would add rewrite: {domain} -> {answer}')
             else:
                 try:
-                    add_agh_rewrite(agh_config, d, a, dry_run=False)
-                    print(f'Added rewrite: {d} -> {a}')
+                    add_agh_rewrite(agh_config, domain, answer, dry_run=False)
+                    print(f'Added rewrite: {domain} -> {answer}')
                 except Exception as exc:
-                    print(f'Failed to add rewrite {d} -> {a}: {exc}', file=sys.stderr)
+                    print(f'Failed to add rewrite {domain} -> {answer}: {exc}', file=sys.stderr)
 
-    for d, answers in current.items():
-        if d in desired or d in permanent_map:
+    for domain, answers in current.items():
+        if domain in desired or domain in permanent_map:
             continue
         for old in answers:
             if dry_run:
-                print(f'[DRY RUN] Would delete rewrite: {d} -> {old}')
+                print(f'[DRY RUN] Would delete rewrite: {domain} -> {old}')
             else:
                 try:
-                    delete_agh_rewrite(agh_config, d, old, dry_run=False)
-                    print(f'Deleted rewrite: {d} -> {old}')
+                    delete_agh_rewrite(agh_config, domain, old, dry_run=False)
+                    print(f'Deleted rewrite: {domain} -> {old}')
                 except Exception as exc:
-                    print(f'Failed to delete rewrite {d} -> {old}: {exc}', file=sys.stderr)
+                    print(f'Failed to delete rewrite {domain} -> {old}: {exc}', file=sys.stderr)
 
 
 def command_report(config, dry_run):
@@ -681,26 +681,26 @@ def command_report(config, dry_run):
     desired.update(permanent_map)
     all_domains = set(desired.keys()) | set(current.keys()) | set(traefik_sources.keys())
 
-    for d in sorted(all_domains):
-        if d in ignore_list:
+    for domain in sorted(all_domains):
+        if domain in ignore_list:
             continue
-        is_permanent = 'permanent' if d in permanent_map else 'derived'
-        if d in permanent_map:
+        is_permanent = 'permanent' if domain in permanent_map else 'derived'
+        if domain in permanent_map:
             source = 'permanent'
-        elif d in traefik_sources:
-            source = ';'.join(sorted(set(traefik_sources.get(d, []))))
-        elif d in current:
+        elif domain in traefik_sources:
+            source = ';'.join(sorted(set(traefik_sources.get(domain, []))))
+        elif domain in current:
             source = 'target-only'
         else:
             source = ''
 
-        target = desired.get(d)
+        target = desired.get(domain)
         if target is None:
-            answers = sorted(current.get(d, []))
+            answers = sorted(current.get(domain, []))
             target = answers[0] if answers else ''
 
-        exists = 'exists' if d in current and target in current.get(d, set()) else 'missing'
-        print(f'{d},{target},{source},{exists},{is_permanent}')
+        exists = 'exists' if domain in current and target in current.get(domain, set()) else 'missing'
+        print(f'{domain},{target},{source},{exists},{is_permanent}')
 
 
 def command_add(config, args):
@@ -709,8 +709,8 @@ def command_add(config, args):
     if duplicates:
         fail(f'Error: duplicate permanent domain records in config: {", ".join(duplicates)}')
 
-    if args.hostname in ignore_list:
-        fail(f'Error: hostname {args.hostname} is in ignore list and cannot be added')
+    if args.domain in ignore_list:
+        fail(f'Error: domain {args.domain} is in ignore list and cannot be added')
 
     agh_config = find_agh_config(config)
     if agh_config is None:
@@ -718,13 +718,13 @@ def command_add(config, args):
 
     try:
         rewrites = fetch_agh_dns_rewrites(agh_config)
-        existing = find_agh_rewrite(rewrites, args.hostname)
+        existing = find_agh_rewrite(rewrites, args.domain)
         if existing:
-            print(f'Warning: hostname {args.hostname} already exists', file=sys.stderr)
+            print(f'Warning: domain {args.domain} already exists', file=sys.stderr)
             print(f'Existing record: {json.dumps(existing)}', file=sys.stderr)
             sys.exit(1)
 
-        result = add_agh_rewrite(agh_config, args.hostname, args.target, dry_run=args.dry_run)
+        result = add_agh_rewrite(agh_config, args.domain, args.target, dry_run=args.dry_run)
         print(f'[DRY RUN] Would add rewrite: {json.dumps(result)}' if args.dry_run else f'Added rewrite: {json.dumps(result)}')
     except Exception as exc:
         fail(f'Failed to add rewrite: {exc}')
@@ -739,22 +739,22 @@ def command_delete(config, args):
         rewrites = fetch_agh_dns_rewrites(agh_config)
 
         if args.target is None:
-            matching = find_agh_rewrites_by_domain(rewrites, args.hostname)
+            matching = find_agh_rewrites_by_domain(rewrites, args.domain)
             if not matching:
-                fail(f'Warning: hostname {args.hostname} not found')
+                fail(f'Warning: domain {args.domain} not found')
             if len(matching) > 1:
-                print(f'Warning: hostname {args.hostname} has multiple records', file=sys.stderr)
+                print(f'Warning: domain {args.domain} has multiple records', file=sys.stderr)
                 for record in matching:
                     print(f'  {json.dumps(record)}', file=sys.stderr)
                 sys.exit(1)
 
             record = matching[0]
-            result = delete_agh_rewrite(agh_config, args.hostname, record.get('answer'), dry_run=args.dry_run)
+            result = delete_agh_rewrite(agh_config, args.domain, record.get('answer'), dry_run=args.dry_run)
         else:
-            record = find_agh_rewrite_by_pair(rewrites, args.hostname, args.target)
+            record = find_agh_rewrite_by_pair(rewrites, args.domain, args.target)
             if not record:
-                fail(f'Warning: record {args.hostname} -> {args.target} not found')
-            result = delete_agh_rewrite(agh_config, args.hostname, args.target, dry_run=args.dry_run)
+                fail(f'Warning: record {args.domain} -> {args.target} not found')
+            result = delete_agh_rewrite(agh_config, args.domain, args.target, dry_run=args.dry_run)
 
         print(f'[DRY RUN] Would delete rewrite: {json.dumps(result)}' if args.dry_run else f'Deleted rewrite: {json.dumps(result)}')
     except Exception as exc:
