@@ -351,7 +351,7 @@ def find_traefik_configs(config):
     return traefik_configs
 
 
-def build_traefik_routers_url(api_url, page, per_page):
+def build_traefik_certificates_url(api_url, page, per_page):
     base = api_url.rstrip('/') + '/api/certificates'
     params = {
         'page': page,
@@ -361,8 +361,21 @@ def build_traefik_routers_url(api_url, page, per_page):
     return f'{base}?{query}'
 
 
-def fetch_traefik_routers(traefik_config, instance_name):
-    """Fetch routers from a Traefik API instance with pagination."""
+def build_traefik_routers_url(api_url, protocol):
+    if protocol not in ('http', 'tcp', 'udp'):
+        raise ValueError('Invalid Traefik router protocol')
+    return api_url.rstrip('/') + f'/api/{protocol}/routers'
+
+
+def parse_traefik_router_rule_hosts(rule):
+    if not isinstance(rule, str):
+        return []
+    matches = re.findall(r'Host\s*\(\s*`([^`]+)`\s*\)', rule, re.IGNORECASE)
+    return [host.strip() for host in matches if isinstance(host, str) and host.strip()]
+
+
+def fetch_traefik_certificates(traefik_config, instance_name):
+    """Fetch certificates from a Traefik API instance with pagination."""
     if not isinstance(traefik_config, dict):
         raise ValueError('Invalid Traefik configuration')
 
@@ -381,8 +394,8 @@ def fetch_traefik_routers(traefik_config, instance_name):
     per_page = 1000
 
     while True:
-        endpoint = build_traefik_routers_url(api_url, page, per_page)
-#        print(f'Fetching Traefik routers from {instance_name} {endpoint} {page} {per_page}...')
+        endpoint = build_traefik_certificates_url(api_url, page, per_page)
+#        print(f'Fetching Traefik certificates from {instance_name} {endpoint} {page} {per_page}...')
         request = Request(endpoint, method='GET')
         request.add_header('Accept', 'application/json')
 
@@ -397,13 +410,13 @@ def fetch_traefik_routers(traefik_config, instance_name):
             with urlopen(request, timeout=timeout, context=context) as response:
                 payload = response.read().decode('utf-8')
 #                print(f'Response from {instance_name} page {page}: {payload[:200]}{"..." if len(payload) > 200 else ""}')
-                routers = json.loads(payload)
-#                print(f'Parsed {len(routers)} routers from {instance_name} page {page}')
-#                print(f'Routers: {json.dumps(routers[:3], indent=2)}{"..." if len(routers) > 3 else ""}')
-                if not routers:
+                certificates = json.loads(payload)
+#                print(f'Parsed {len(certificates)} certificates from {instance_name} page {page}')
+#                print(f'Certificates: {json.dumps(certificates[:3], indent=2)}{"..." if len(certificates) > 3 else ""}')
+                if not certificates:
                     break
-                all_routers.extend(routers)
-#                print(f'Routers already collected from {instance_name}: {len(all_routers)}')
+                all_routers.extend(certificates)
+#                print(f'Certificates already collected from {instance_name}: {len(all_routers)}')
 
                 next_page = response.getheader('x-next-page')
                 if next_page is not None:
@@ -427,12 +440,104 @@ def fetch_traefik_routers(traefik_config, instance_name):
         except json.JSONDecodeError as exc:
             raise RuntimeError('Failed to decode Traefik API response as JSON') from exc
 
-    # Return an empty list when no routers were found, so callers can handle it uniformly.
+    # Return an empty list when no certificates were found, so callers can handle it uniformly.
     return all_routers, instance_name
 
 
+def fetch_traefik_routers(traefik_config, instance_name):
+    """Fetch routers from Traefik API endpoints for http, tcp, and udp."""
+    if not isinstance(traefik_config, dict):
+        raise ValueError('Invalid Traefik configuration')
+
+    api_url = traefik_config.get('api_url')
+    if not api_url:
+        raise ValueError('Traefik API URL is missing')
+
+    api_user = traefik_config.get('api_user') or traefik_config.get('user')
+    api_password = traefik_config.get('api_password') or traefik_config.get('password')
+
+    timeout = traefik_config.get('http_timeout', 30)
+    ignore_tls = bool(traefik_config.get('ignore_tls_errors', False))
+
+    all_routers = []
+    for protocol in ('http', 'tcp', 'udp'):
+        endpoint = build_traefik_routers_url(api_url, protocol)
+        request = Request(endpoint, method='GET')
+        request.add_header('Accept', 'application/json')
+
+        if api_user and api_password:
+            auth_header = build_basic_auth_header(api_user, api_password)
+            if auth_header:
+                request.add_header('Authorization', auth_header)
+
+        context = build_ssl_context(ignore_tls, endpoint)
+
+        try:
+            with urlopen(request, timeout=timeout, context=context) as response:
+                payload = response.read().decode('utf-8')
+                routers = json.loads(payload)
+                if not isinstance(routers, list):
+                    raise RuntimeError('Traefik routers response is not a list')
+                all_routers.extend(routers)
+        except HTTPError as exc:
+            if exc.code == 404:
+                continue
+            raise RuntimeError(f'Traefik API error {exc.code} on {protocol}/routers: {exc.reason}') from exc
+        except URLError as exc:
+            raise RuntimeError(f'Traefik API connection failed: {exc.reason}') from exc
+        except json.JSONDecodeError as exc:
+            raise RuntimeError('Failed to decode Traefik API response as JSON') from exc
+
+    return all_routers, instance_name
+
+
+def merge_traefik_certificates(traefik_config, instance_name):
+    """Fetch and merge hostnames from Traefik certificates."""
+    merged_hostnames = set()
+    
+    try:
+        certificates, _ = fetch_traefik_certificates(traefik_config, instance_name)
+#            print(f'Fetched {len(certificates)} certificates from {instance_name}')
+        for cert in certificates:
+#                print(f'Processing certificate from {instance_name}: {json.dumps(cert, indent=2)}')
+            common_name = cert.get('commonName')
+            if isinstance(common_name, str):
+#                    print(f'Found commonName in {instance_name} certificate: {common_name}')
+                merged_hostnames.add(common_name)
+            for san in cert.get('sans', []):
+                if isinstance(san, str):
+#                        print(f'Found SAN in {instance_name} certificate: {san}')
+                    merged_hostnames.add(san)
+
+#                print(f'Merged hostnames from {instance_name}: {len(merged_hostnames)}')
+#                print(f'Hostnames from {instance_name}: {json.dumps(sorted(list(merged_hostnames)), indent=2)}')
+
+    except Exception as exc:
+        raise RuntimeError(f'Failed to fetch certificates from {instance_name}: {exc}') from exc
+    
+    return sorted(list(merged_hostnames))
+
+
+def merge_traefik_routers_discovery(traefik_config, instance_name):
+    """Fetch and merge hostnames from Traefik routers endpoints."""
+    merged_hostnames = set()
+
+    try:
+        routers, _ = fetch_traefik_routers(traefik_config, instance_name)
+        for router in routers:
+            if not isinstance(router, dict):
+                continue
+            rule = router.get('rule')
+            for hostname in parse_traefik_router_rule_hosts(rule):
+                merged_hostnames.add(hostname)
+    except Exception as exc:
+        raise RuntimeError(f'Failed to fetch routers from {instance_name}: {exc}') from exc
+
+    return sorted(list(merged_hostnames))
+
+
 def merge_traefik_data(config):
-    """Fetch and merge hostnames from Traefik routers."""
+    """Fetch and merge hostnames from Traefik sources based on configuration."""
     traefik_configs = find_traefik_configs(config)
     if not traefik_configs:
         return []
@@ -444,25 +549,28 @@ def merge_traefik_data(config):
     for instance_name, traefik_config in traefik_configs.items():
         merged_hostnames = set()
         
-        try:
-            routers, _ = fetch_traefik_routers(traefik_config, instance_name)
-#            print(f'Fetched {len(routers)} routers from {instance_name}')
-            for router in routers:
-#                print(f'Processing router from {instance_name}: {json.dumps(router, indent=2)}')
-                common_name = router.get('commonName')
-                if isinstance(common_name, str):
-#                    print(f'Found commonName in {instance_name} router: {common_name}')
-                    merged_hostnames.add(common_name)
-                for san in router.get('sans', []):
-                    if isinstance(san, str):
-#                        print(f'Found SAN in {instance_name} router: {san}')
-                        merged_hostnames.add(san)
-
-#                print(f'Merged hostnames from {instance_name}: {len(merged_hostnames)}')
-#                print(f'Hostnames from {instance_name}: {json.dumps(sorted(list(merged_hostnames)), indent=2)}')
-
-        except Exception as exc:
-            raise RuntimeError(f'Failed to fetch routers from {instance_name}: {exc}') from exc
+        # Determine which sources to use
+        sources = traefik_config.get('sources', ['certificates'])
+        if not isinstance(sources, list):
+            sources = ['certificates']
+        if not sources:
+            sources = ['certificates']
+        
+        # Fetch from certificates if configured
+        if 'certificates' in sources:
+            try:
+                hostnames = merge_traefik_certificates(traefik_config, instance_name)
+                merged_hostnames.update(hostnames)
+            except Exception as exc:
+                raise RuntimeError(f'Failed to fetch certificates from {instance_name}: {exc}') from exc
+        
+        # Fetch from routers if configured
+        if 'routers' in sources:
+            try:
+                hostnames = merge_traefik_routers_discovery(traefik_config, instance_name)
+                merged_hostnames.update(hostnames)
+            except Exception as exc:
+                raise RuntimeError(f'Failed to fetch routers from {instance_name}: {exc}') from exc
         
 #        print(f'Merged hostnames from {instance_name}: {len(merged_hostnames)}')
 #        print(f'Hostnames from {instance_name}: {merged_hostnames}')
@@ -533,9 +641,12 @@ def build_permanent_map(perm_section):
     return permanent_map, ignore_list, duplicates
 
 
-def build_desired_from_sources(config, permanent_map, ignore_list, warn_missing_default_target=False):
+def build_desired_from_sources(config, permanent_map, ignore_list, allowed_base_domains=None, warn_missing_default_target=False):
     desired = {}
     traefik_sources = {}
+
+    if allowed_base_domains is None:
+        allowed_base_domains = []
 
     traefik_data = merge_traefik_data(config)
     traefik_configs = find_traefik_configs(config)
@@ -560,6 +671,10 @@ def build_desired_from_sources(config, permanent_map, ignore_list, warn_missing_
                     print(f'Warning: hostname {domain} from source {source} is in ignore list, skipping', file=sys.stderr)
                 continue
             if domain in permanent_map:
+                continue
+            if not domain_is_allowed(domain, allowed_base_domains):
+                if warn_missing_default_target:
+                    print(f'Warning: hostname {domain} from source {source} is not under allowed_base_domains, skipping', file=sys.stderr)
                 continue
             if default_target is not None:
                 desired[domain] = default_target
@@ -606,6 +721,8 @@ def normalize_allowed_domains(allowed_domains):
 def domain_is_allowed(domain, allowed_base_domains):
     if not isinstance(domain, str):
         return False
+    if not allowed_base_domains:
+        return True
     domain = domain.strip().lower()
     if not domain:
         return False
@@ -631,10 +748,9 @@ def command_sync(config, dry_run):
     if duplicates:
         raise ValueError(f'Error: duplicate permanent domain records in config: {", ".join(duplicates)}')
 
-    desired, _ = build_desired_from_sources(config, permanent_map, ignore_list, warn_missing_default_target=True)
+    allowed_base_domains = normalize_allowed_domains(config.get('allowed_base_domains', []) or config.get('default', {}).get('allowed_base_domains', []))
+    desired, _ = build_desired_from_sources(config, permanent_map, ignore_list, allowed_base_domains, warn_missing_default_target=True)
     desired.update(permanent_map)
-
-    allowed_base_domains = normalize_allowed_domains(config.get('allowed_base_domains', []))
 
     try:
         rewrites = fetch_agh_dns_rewrites(agh_config)
@@ -704,9 +820,10 @@ def command_report(config, dry_run):
     if duplicates:
         fail(f'Error: duplicate permanent domain records in config: {", ".join(duplicates)}')
 
+    allowed_base_domains = normalize_allowed_domains(config.get('allowed_base_domains', []) or config.get('default', {}).get('allowed_base_domains', []))
     desired, traefik_sources = {}, {}
     try:
-        desired, traefik_sources = build_desired_from_sources(config, permanent_map, ignore_list)
+        desired, traefik_sources = build_desired_from_sources(config, permanent_map, ignore_list, allowed_base_domains)
     except Exception:
         desired, traefik_sources = {}, {}
 

@@ -7,6 +7,7 @@ default:
 
   allowed_base_domains:
     - example.com
+    - another.org
 
 permanent:
   ignore:
@@ -31,6 +32,10 @@ source:
     default_target: 192.168.1.10
     http_timeout: 10s
     ignore_tls_errors: false
+    sources:
+      - certificates
+ #     - routers
+
 
   traefik_backup:
     type: traefik_api
@@ -40,6 +45,9 @@ source:
     default_target: 192.168.1.20
     http_timeout: 10s
     ignore_tls_errors: false
+    sources:
+#      - certificates
+      - routers
 
 target:
   adguardhome:
