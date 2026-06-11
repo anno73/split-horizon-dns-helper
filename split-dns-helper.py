@@ -378,7 +378,7 @@ def fetch_traefik_routers(traefik_config, instance_name):
 
     all_routers = []
     page = 1
-    per_page = 10
+    per_page = 1000
 
     while True:
         endpoint = build_traefik_routers_url(api_url, page, per_page)
@@ -589,6 +589,32 @@ def build_current_answer_sets(rewrites):
     return current
 
 
+def normalize_allowed_domains(allowed_domains):
+    if isinstance(allowed_domains, str):
+        allowed_domains = [allowed_domains]
+    if not isinstance(allowed_domains, list):
+        return []
+    normalized = []
+    for item in allowed_domains:
+        if isinstance(item, str):
+            item = item.strip().lower()
+            if item:
+                normalized.append(item)
+    return normalized
+
+
+def domain_is_allowed(domain, allowed_base_domains):
+    if not isinstance(domain, str):
+        return False
+    domain = domain.strip().lower()
+    if not domain:
+        return False
+    for base in allowed_base_domains:
+        if domain == base or domain.endswith('.' + base):
+            return True
+    return False
+
+
 def command_daemon(dry_run):
     suffix = ' (dry run)' if dry_run else ''
     print(f'Not implemented: Command: daemon{suffix}')
@@ -607,6 +633,8 @@ def command_sync(config, dry_run):
 
     desired, _ = build_desired_from_sources(config, permanent_map, ignore_list, warn_missing_default_target=True)
     desired.update(permanent_map)
+
+    allowed_base_domains = normalize_allowed_domains(config.get('allowed_base_domains', []))
 
     try:
         rewrites = fetch_agh_dns_rewrites(agh_config)
@@ -644,6 +672,10 @@ def command_sync(config, dry_run):
 
     for domain, answers in current.items():
         if domain in desired or domain in permanent_map:
+            continue
+        if not domain_is_allowed(domain, allowed_base_domains):
+            for old in answers:
+                print(f'Not in allowed list, keeping rewrite: {domain} -> {old}')
             continue
         for old in answers:
             if dry_run:

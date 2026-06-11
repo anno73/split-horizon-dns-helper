@@ -5,6 +5,9 @@ default:
 
   dry_run: true
 
+  allowed_base_domains:
+    - example.com
+
 permanent:
   ignore:
     - "*.example.com"
