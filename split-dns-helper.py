@@ -735,7 +735,7 @@ def command_report(config, dry_run):
         print(f'{domain},{target},{source},{exists},{is_permanent}')
 
 
-def command_add(config, args):
+def command_add(config, args, dry_run=False):
     perm_section = config.get('permanent', {}) or {}
     permanent_map, ignore_list, duplicates = build_permanent_map(perm_section)
     if duplicates:
@@ -756,13 +756,13 @@ def command_add(config, args):
             print(f'Existing record: {json.dumps(existing)}', file=sys.stderr)
             sys.exit(1)
 
-        result = add_agh_rewrite(agh_config, args.domain, args.target, dry_run=args.dry_run)
-        print(f'[DRY RUN] Would add rewrite: {json.dumps(result)}' if args.dry_run else f'Added rewrite: {json.dumps(result)}')
+        result = add_agh_rewrite(agh_config, args.domain, args.target, dry_run=dry_run)
+        print(f'[DRY RUN] Would add rewrite: {json.dumps(result)}' if dry_run else f'Added rewrite: {json.dumps(result)}')
     except Exception as exc:
         fail(f'Failed to add rewrite: {exc}')
 
 
-def command_delete(config, args):
+def command_delete(config, args, dry_run=False):
     agh_config = find_agh_config(config)
     if agh_config is None:
         fail('No AdGuard Home configuration found in config')
@@ -781,14 +781,14 @@ def command_delete(config, args):
                 sys.exit(1)
 
             record = matching[0]
-            result = delete_agh_rewrite(agh_config, args.domain, record.get('answer'), dry_run=args.dry_run)
+            result = delete_agh_rewrite(agh_config, args.domain, record.get('answer'), dry_run=dry_run)
         else:
             record = find_agh_rewrite_by_pair(rewrites, args.domain, args.target)
             if not record:
                 fail(f'Warning: record {args.domain} -> {args.target} not found')
-            result = delete_agh_rewrite(agh_config, args.domain, args.target, dry_run=args.dry_run)
+            result = delete_agh_rewrite(agh_config, args.domain, args.target, dry_run=dry_run)
 
-        print(f'[DRY RUN] Would delete rewrite: {json.dumps(result)}' if args.dry_run else f'Deleted rewrite: {json.dumps(result)}')
+        print(f'[DRY RUN] Would delete rewrite: {json.dumps(result)}' if dry_run else f'Deleted rewrite: {json.dumps(result)}')
     except Exception as exc:
         fail(f'Failed to delete rewrite: {exc}')
 
@@ -797,19 +797,22 @@ def main():
     args = parse_args()
     config = load_config(args.config)
 
+    # Determine dry_run: command line flag takes precedence, then config default
+    dry_run = args.dry_run or config.get('default', {}).get('dry_run', False)
+
     if args.command == 'daemon':
-        command_daemon(args.dry_run)
+        command_daemon(dry_run)
     elif args.command == 'sync':
         try:
-            command_sync(config, args.dry_run)
+            command_sync(config, dry_run)
         except ValueError as exc:
             fail(str(exc))
     elif args.command == 'report':
-        command_report(config, args.dry_run)
+        command_report(config, dry_run)
     elif args.command == 'add':
-        command_add(config, args)
+        command_add(config, args, dry_run)
     elif args.command == 'delete':
-        command_delete(config, args)
+        command_delete(config, args, dry_run)
     else:
         fail('Unknown command', 2)
 
