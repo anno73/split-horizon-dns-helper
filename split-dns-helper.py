@@ -20,7 +20,7 @@ except Exception:
 DEFAULT_CONFIG_FILE = '/etc/dns-sh-config.yml'
 CUSTOM_FILTERING_RULES_START = '! BEGIN split-dns-helper managed custom filtering rules'
 CUSTOM_FILTERING_RULES_END = '! END split-dns-helper managed custom filtering rules'
-CUSTOM_FILTERING_RULES_REASON = '! A-only rewrites preserve SOA lookups required for ACME DNS-01.'
+CUSTOM_FILTERING_RULES_REASON = '! A-only rewrites preserve SOA lookups required for ACME DNS-01 (traefik on QNAP).'
 
 DEFAULT_CONFIG = {
     'adguardhome': {
