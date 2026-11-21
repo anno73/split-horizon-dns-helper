@@ -1,7 +1,7 @@
 # Implementation progress: QNAP ACME DNS-01 custom filtering rules
 
 **Branch:** `feature/qnap-acme-dns01-custom-filtering-rules`
-**Status:** In progress.
+**Status:** Implemented, tested, merged, and pushed.
 
 ## Done
 
@@ -24,11 +24,13 @@
 - Added 11 focused tests covering marker reconciliation, API request shapes,
   collision aborts, sync/dry-run, and rewrite exclusion. All tests pass.
 - Python syntax checks and `git diff --check` pass.
+- Committed the feature as `4e046f3` and merged upstream `main` commit
+  `4dfd4d5` into the feature branch as `465ec15`.
+- Pushed the feature branch from WSL and fast-forwarded remote `main` to
+  `465ec15`.
 
 ## Still to do
 
-- Review/stage only feature files, excluding the ignored config and pre-existing
-  unrelated untracked files and mode-only worktree change.
-- Commit with the required co-author trailer.
-- Fetch and inspect upstream changes, then merge and push if the verified
-  feature branch can be integrated safely.
+- No feature work remains.
+- Preserve the unrelated untracked files and the pre-existing local mode-only
+  change to `split-dns-helper.py`; none are part of the feature commit.
