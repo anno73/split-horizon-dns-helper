@@ -2,6 +2,7 @@
 
 import argparse
 import base64
+import ipaddress
 import json
 import re
 import ssl
@@ -17,6 +18,9 @@ except Exception:
     yaml = None
 
 DEFAULT_CONFIG_FILE = '/etc/dns-sh-config.yml'
+CUSTOM_FILTERING_RULES_START = '! BEGIN split-dns-helper managed custom filtering rules'
+CUSTOM_FILTERING_RULES_END = '! END split-dns-helper managed custom filtering rules'
+CUSTOM_FILTERING_RULES_REASON = '! A-only rewrites preserve SOA lookups required for ACME DNS-01.'
 
 DEFAULT_CONFIG = {
     'adguardhome': {
@@ -218,6 +222,158 @@ def fetch_agh_dns_rewrites(agh_config):
         raise RuntimeError(f'AGH API connection failed: {exc.reason}') from exc
     except json.JSONDecodeError as exc:
         raise RuntimeError('Failed to decode AGH API response as JSON') from exc
+
+
+def fetch_agh_custom_filtering_rules(agh_config):
+    """Fetch user-defined AdGuard Home filtering rules."""
+    if not isinstance(agh_config, dict):
+        raise ValueError('Invalid AdGuard Home configuration')
+
+    url = agh_config.get('url')
+    if not url:
+        raise ValueError('AdGuard Home URL is missing')
+
+    api_user = agh_config.get('api_user') or agh_config.get('user')
+    api_password = agh_config.get('api_password') or agh_config.get('password')
+    auth_header = build_basic_auth_header(api_user, api_password)
+    endpoint = url.rstrip('/') + '/control/filtering/status'
+    request = Request(endpoint, method='GET')
+    request.add_header('Accept', 'application/json')
+    if auth_header:
+        request.add_header('Authorization', auth_header)
+
+    timeout = agh_config.get('http_timeout', 30)
+    context = build_ssl_context(bool(agh_config.get('ignore_tls_errors', False)), endpoint)
+
+    try:
+        with urlopen(request, timeout=timeout, context=context) as response:
+            payload = json.loads(response.read().decode('utf-8'))
+    except HTTPError as exc:
+        raise RuntimeError(f'AGH filtering API error {exc.code}: {exc.reason}') from exc
+    except URLError as exc:
+        raise RuntimeError(f'AGH filtering API connection failed: {exc.reason}') from exc
+    except json.JSONDecodeError as exc:
+        raise RuntimeError('Failed to decode AGH filtering API response as JSON') from exc
+
+    rules = payload.get('user_rules') if isinstance(payload, dict) else None
+    if not isinstance(rules, list) or not all(isinstance(rule, str) for rule in rules):
+        raise RuntimeError('AGH filtering status response does not contain a valid user_rules list')
+    return rules
+
+
+def set_agh_custom_filtering_rules(agh_config, rules):
+    """Replace AdGuard Home user rules with the reconciled rule list."""
+    if not isinstance(agh_config, dict):
+        raise ValueError('Invalid AdGuard Home configuration')
+
+    url = agh_config.get('url')
+    if not url:
+        raise ValueError('AdGuard Home URL is missing')
+
+    api_user = agh_config.get('api_user') or agh_config.get('user')
+    api_password = agh_config.get('api_password') or agh_config.get('password')
+    auth_header = build_basic_auth_header(api_user, api_password)
+    endpoint = url.rstrip('/') + '/control/filtering/set_rules'
+    data = json.dumps({'rules': rules}).encode('utf-8')
+    request = Request(endpoint, method='POST', data=data)
+    request.add_header('Content-Type', 'application/json')
+    request.add_header('Accept', 'application/json')
+    if auth_header:
+        request.add_header('Authorization', auth_header)
+
+    timeout = agh_config.get('http_timeout', 30)
+    context = build_ssl_context(bool(agh_config.get('ignore_tls_errors', False)), endpoint)
+
+    try:
+        with urlopen(request, timeout=timeout, context=context) as response:
+            response.read()
+    except HTTPError as exc:
+        raise RuntimeError(f'AGH filtering API error {exc.code}: {exc.reason}') from exc
+    except URLError as exc:
+        raise RuntimeError(f'AGH filtering API connection failed: {exc.reason}') from exc
+
+
+def build_custom_filtering_rule_map(section):
+    """Build hostname -> IPv4 answer entries for AdGuard A-only rules."""
+    if section is None:
+        return {}
+    if not isinstance(section, dict):
+        raise ValueError('custom_filtering_rules section must be a mapping of answer -> [hosts]')
+
+    rules = {}
+    for answer, hosts in section.items():
+        if not isinstance(answer, str):
+            raise ValueError('custom_filtering_rules answers must be IPv4 address strings')
+        try:
+            parsed_answer = ipaddress.ip_address(answer.strip())
+        except ValueError as exc:
+            raise ValueError(f'Invalid IP address in custom_filtering_rules: {answer}') from exc
+        if parsed_answer.version != 4:
+            raise ValueError(f'custom_filtering_rules answer must be IPv4: {answer}')
+        answer = str(parsed_answer)
+
+        if isinstance(hosts, str):
+            hosts = [hosts]
+        if not isinstance(hosts, list):
+            raise ValueError(f'Invalid hosts list for answer {answer} in custom_filtering_rules')
+
+        for host in hosts:
+            if not isinstance(host, str) or not host.strip():
+                raise ValueError(f'Invalid hostname for answer {answer} in custom_filtering_rules')
+            host = host.strip().lower()
+            if any(character in host for character in ('|', ',', ';', '\n', '\r')):
+                raise ValueError(f'Invalid hostname for answer {answer} in custom_filtering_rules: {host}')
+            if host in rules:
+                raise ValueError(f'Duplicate hostname in custom_filtering_rules: {host}')
+            rules[host] = answer
+
+    return rules
+
+
+def build_custom_filtering_rule_block(rule_map):
+    if not rule_map:
+        return []
+    block = [CUSTOM_FILTERING_RULES_START, CUSTOM_FILTERING_RULES_REASON]
+    for host, answer in sorted(rule_map.items()):
+        block.append(f'|{host}|$dnsrewrite=NOERROR;A;{answer},dnstype=A')
+    block.append(CUSTOM_FILTERING_RULES_END)
+    return block
+
+
+def reconcile_custom_filtering_rules(current_rules, desired_rule_map):
+    """Replace the helper-owned block while preserving all other user rules."""
+    if not isinstance(current_rules, list) or not all(isinstance(rule, str) for rule in current_rules):
+        raise ValueError('Existing AdGuard custom filtering rules must be a list of strings')
+
+    desired_block = build_custom_filtering_rule_block(desired_rule_map)
+    reconciled = []
+    inside_block = False
+    found_block = False
+
+    for rule in current_rules:
+        if rule == CUSTOM_FILTERING_RULES_START:
+            if inside_block or found_block:
+                raise ValueError('Multiple or nested split-dns-helper custom filtering rule blocks found')
+            inside_block = True
+            found_block = True
+            reconciled.extend(desired_block)
+            continue
+        if rule == CUSTOM_FILTERING_RULES_END:
+            if not inside_block:
+                raise ValueError('Unmatched split-dns-helper custom filtering rule block end marker')
+            inside_block = False
+            continue
+        if not inside_block:
+            reconciled.append(rule)
+
+    if inside_block:
+        raise ValueError('Unmatched split-dns-helper custom filtering rule block start marker')
+    if not found_block and desired_block:
+        if reconciled and reconciled[-1] != '':
+            reconciled.append('')
+        reconciled.extend(desired_block)
+
+    return reconciled
 
 
 def find_agh_rewrite(rewrites, domain):
@@ -641,12 +797,42 @@ def build_permanent_map(perm_section):
     return permanent_map, ignore_list, duplicates
 
 
-def build_desired_from_sources(config, permanent_map, ignore_list, allowed_base_domains=None, warn_missing_default_target=False):
+def find_custom_filtering_rule_conflicts(config):
+    if not isinstance(config, dict):
+        return []
+    permanent_map, _, _ = build_permanent_map(config.get('permanent', {}) or {})
+    custom_rule_map = build_custom_filtering_rule_map(config.get('custom_filtering_rules'))
+    permanent_hosts = {host.strip().lower() for host in permanent_map}
+    return sorted(permanent_hosts.intersection(custom_rule_map))
+
+
+def validate_custom_filtering_rule_conflicts(config):
+    conflicts = find_custom_filtering_rule_conflicts(config)
+    if not conflicts:
+        return
+    for host in conflicts:
+        print(
+            f'Warning: hostname {host} is configured in both permanent and custom_filtering_rules',
+            file=sys.stderr,
+        )
+    raise ValueError('Remove overlapping hostnames from either permanent or custom_filtering_rules before continuing')
+
+
+def build_desired_from_sources(
+    config,
+    permanent_map,
+    ignore_list,
+    allowed_base_domains=None,
+    warn_missing_default_target=False,
+    custom_filtering_hosts=None,
+):
     desired = {}
     traefik_sources = {}
 
     if allowed_base_domains is None:
         allowed_base_domains = []
+    if custom_filtering_hosts is None:
+        custom_filtering_hosts = set()
 
     traefik_data = merge_traefik_data(config)
     traefik_configs = find_traefik_configs(config)
@@ -659,13 +845,19 @@ def build_desired_from_sources(config, permanent_map, ignore_list, allowed_base_
 
         if default_target is None and warn_missing_default_target:
             for domain in hostnames:
-                if domain in permanent_map or domain in ignore_list:
+                if (
+                    domain in permanent_map
+                    or domain in ignore_list
+                    or domain.strip().lower() in custom_filtering_hosts
+                ):
                     continue
                 print(f'Warning: no default_target for source {source}, skipping hostname {domain}', file=sys.stderr)
             continue
 
         for domain in hostnames:
             traefik_sources.setdefault(domain, []).append(source)
+            if domain.strip().lower() in custom_filtering_hosts:
+                continue
             if domain in ignore_list:
                 if warn_missing_default_target:
                     print(f'Warning: hostname {domain} from source {source} is in ignore list, skipping', file=sys.stderr)
@@ -748,14 +940,43 @@ def command_sync(config, dry_run):
     if duplicates:
         raise ValueError(f'Error: duplicate permanent domain records in config: {", ".join(duplicates)}')
 
+    custom_rule_map = build_custom_filtering_rule_map(config.get('custom_filtering_rules'))
     allowed_base_domains = normalize_allowed_domains(config.get('allowed_base_domains', []) or config.get('default', {}).get('allowed_base_domains', []))
-    desired, _ = build_desired_from_sources(config, permanent_map, ignore_list, allowed_base_domains, warn_missing_default_target=True)
+    desired, _ = build_desired_from_sources(
+        config,
+        permanent_map,
+        ignore_list,
+        allowed_base_domains,
+        warn_missing_default_target=True,
+        custom_filtering_hosts=set(custom_rule_map),
+    )
     desired.update(permanent_map)
 
     try:
         rewrites = fetch_agh_dns_rewrites(agh_config)
     except Exception as exc:
         fail(f'Failed to read AdGuard Home rewrites: {exc}')
+
+    try:
+        current_custom_rules = fetch_agh_custom_filtering_rules(agh_config)
+        reconciled_custom_rules = reconcile_custom_filtering_rules(
+            current_custom_rules,
+            custom_rule_map,
+        )
+    except (RuntimeError, ValueError) as exc:
+        fail(f'Failed to prepare AdGuard Home custom filtering rules: {exc}')
+
+    if reconciled_custom_rules != current_custom_rules:
+        if dry_run:
+            print('[DRY RUN] Would update AdGuard Home custom filtering rules')
+        else:
+            try:
+                set_agh_custom_filtering_rules(agh_config, reconciled_custom_rules)
+                print('Updated AdGuard Home custom filtering rules')
+            except (RuntimeError, ValueError) as exc:
+                fail(f'Failed to update AdGuard Home custom filtering rules: {exc}')
+    else:
+        print('[DRY RUN] Unchanged AdGuard Home custom filtering rules' if dry_run else 'Unchanged AdGuard Home custom filtering rules')
 
     current = build_current_mapping(rewrites)
 
@@ -815,6 +1036,14 @@ def command_report(config, dry_run):
             print(f'Failed to read AdGuard Home rewrites: {exc}', file=sys.stderr)
 
     current = build_current_answer_sets(rewrites)
+    custom_rule_map = build_custom_filtering_rule_map(config.get('custom_filtering_rules'))
+    current_custom_rules = []
+    if agh_config is not None and custom_rule_map:
+        try:
+            current_custom_rules = fetch_agh_custom_filtering_rules(agh_config)
+        except (RuntimeError, ValueError) as exc:
+            print(f'Failed to read AdGuard Home custom filtering rules: {exc}', file=sys.stderr)
+
     perm_section = config.get('permanent', {}) or {}
     permanent_map, ignore_list, duplicates = build_permanent_map(perm_section)
     if duplicates:
@@ -823,32 +1052,54 @@ def command_report(config, dry_run):
     allowed_base_domains = normalize_allowed_domains(config.get('allowed_base_domains', []) or config.get('default', {}).get('allowed_base_domains', []))
     desired, traefik_sources = {}, {}
     try:
-        desired, traefik_sources = build_desired_from_sources(config, permanent_map, ignore_list, allowed_base_domains)
+        desired, traefik_sources = build_desired_from_sources(
+            config,
+            permanent_map,
+            ignore_list,
+            allowed_base_domains,
+            custom_filtering_hosts=set(custom_rule_map),
+        )
     except Exception:
         desired, traefik_sources = {}, {}
 
     desired.update(permanent_map)
-    all_domains = set(desired.keys()) | set(current.keys()) | set(traefik_sources.keys())
+    all_domains = {
+        domain
+        for domain in set(desired.keys()) | set(current.keys()) | set(traefik_sources.keys())
+        if domain.strip().lower() not in custom_rule_map
+    } | set(custom_rule_map)
 
     for domain in sorted(all_domains):
         if domain in ignore_list:
             continue
-        is_permanent = 'permanent' if domain in permanent_map else 'derived'
-        if domain in permanent_map:
+        custom_domain = domain.strip().lower()
+        if custom_domain in custom_rule_map:
+            is_permanent = 'custom'
+            source = 'custom_filtering_rules'
+            target = custom_rule_map[custom_domain]
+            custom_rule = f'|{custom_domain}|$dnsrewrite=NOERROR;A;{target},dnstype=A'
+            exists = 'exists' if custom_rule in current_custom_rules else 'missing'
+        elif domain in permanent_map:
+            is_permanent = 'permanent'
             source = 'permanent'
-        elif domain in traefik_sources:
-            source = ';'.join(sorted(set(traefik_sources.get(domain, []))))
-        elif domain in current:
-            source = 'target-only'
+            target = desired.get(domain)
+            if target is None:
+                answers = sorted(current.get(domain, []))
+                target = answers[0] if answers else ''
+            exists = 'exists' if domain in current and target in current.get(domain, set()) else 'missing'
         else:
-            source = ''
-
-        target = desired.get(domain)
-        if target is None:
-            answers = sorted(current.get(domain, []))
-            target = answers[0] if answers else ''
-
-        exists = 'exists' if domain in current and target in current.get(domain, set()) else 'missing'
+            is_permanent = 'derived'
+            if domain in traefik_sources:
+                source = ';'.join(sorted(set(traefik_sources.get(domain, []))))
+            elif domain in current:
+                source = 'target-only'
+            else:
+                source = ''
+            target = desired.get(domain)
+            if target is None:
+                answers = sorted(current.get(domain, []))
+                target = answers[0] if answers else ''
+            exists = 'exists' if domain in current and target in current.get(domain, set()) else 'missing'
         print(f'{domain},{target},{source},{exists},{is_permanent}')
 
 
@@ -860,6 +1111,10 @@ def command_add(config, args, dry_run=False):
 
     if args.domain in ignore_list:
         fail(f'Error: domain {args.domain} is in ignore list and cannot be added')
+
+    custom_rule_map = build_custom_filtering_rule_map(config.get('custom_filtering_rules'))
+    if args.domain.strip().lower() in custom_rule_map:
+        fail(f'Error: domain {args.domain} is managed by custom_filtering_rules, not DNS rewrites')
 
     agh_config = find_agh_config(config)
     if agh_config is None:
@@ -913,6 +1168,10 @@ def command_delete(config, args, dry_run=False):
 def main():
     args = parse_args()
     config = load_config(args.config)
+    try:
+        validate_custom_filtering_rule_conflicts(config)
+    except ValueError as exc:
+        fail(str(exc))
 
     # Determine dry_run: command line flag takes precedence, then config default
     dry_run = args.dry_run or config.get('default', {}).get('dry_run', False)
