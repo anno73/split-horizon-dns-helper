@@ -20,7 +20,7 @@ permanent:
     - traefik.example.com
 
   192.168.1.20: # backup node
-    - traefik.backup.hubmann.casa
+    - traefik.backup.example.com
 
 # AdGuard Home custom filtering rules. These use A-only DNS rewrites so other
 # record types (including SOA for ACME DNS-01 discovery) can reach upstream.
